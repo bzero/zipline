@@ -32,10 +32,16 @@ class RollingPanel(object):
     Restrictions: major_axis can only be a DatetimeIndex for now
     """
 
-    def __init__(self, window, items, sids, cap_multiple=2, dtype=np.float64):
+    def __init__(self,
+                 window,
+                 items,
+                 sids,
+                 cap_multiple=2,
+                 dtype=np.float64,
+                 date_buf=None):
 
-        self.pos = 0
-        self.window = window
+        self._pos = window
+        self._window = window
 
         self.items = _ensure_index(items)
         self.minor_axis = _ensure_index(sids)
@@ -44,22 +50,28 @@ class RollingPanel(object):
         self.cap = cap_multiple * window
 
         self.dtype = dtype
-        self.date_buf = np.empty(self.cap, dtype='M8[ns]')
+        self.date_buf = np.empty(self.cap, dtype='M8[ns]') \
+            if date_buf is None else date_buf
 
         self.buffer = self._create_buffer()
 
+    @property
     def _oldest_frame_idx(self):
-        return max(self.pos - self.window, 0)
+        return self._pos - self._window
 
     def oldest_frame(self):
         """
         Get the oldest frame in the panel.
         """
-        return self.buffer.iloc[:, self._oldest_frame_idx(), :]
+        return self.buffer.iloc[:, self._oldest_frame_idx, :]
 
-    def set_sids(self, sids):
-        self.minor_axis = _ensure_index(sids)
+    def set_minor_axis(self, minor_axis):
+        self.minor_axis = _ensure_index(minor_axis)
         self.buffer = self.buffer.reindex(minor_axis=self.minor_axis)
+
+    def set_items(self, items):
+        self.items = _ensure_index(items)
+        self.buffer = self.buffer.reindex(items=self.items)
 
     def _create_buffer(self):
         panel = pd.Panel(
@@ -70,16 +82,47 @@ class RollingPanel(object):
         )
         return panel
 
+    def resize(self, window):
+        """
+        Resizes the buffer to hold a new window with a new cap_multiple.
+        If cap_multiple is None, then the old cap_multiple is used.
+        """
+        self._window = window
+
+        pre = self.cap
+        self.cap = self.cap_multiple * window
+        delta = self.cap - pre
+
+        self._pos += delta
+
+        self.date_buf = self.date_buf.copy()
+        self.date_buf.resize(self.cap)
+        self.date_buf = np.roll(self.date_buf, delta)
+
+        self.buffer = pd.concat(
+            [
+                pd.Panel(
+                    items=self.items,
+                    minor_axis=self.minor_axis,
+                    major_axis=np.arange(delta),
+                    dtype=self.dtype,
+                ),
+                self.buffer
+            ],
+            axis=1,
+        )
+        self.buffer.major_axis = pd.Int64Index(range(self.cap))
+
     def add_frame(self, tick, frame):
         """
         """
-        if self.pos == self.cap:
+        if self._pos == self.cap:
             self._roll_data()
 
-        self.buffer.loc[:, self.pos, :] = frame.T.astype(self.dtype)
-        self.date_buf[self.pos] = tick
+        self.buffer.loc[:, self._pos, :] = frame.T.astype(self.dtype)
+        self.date_buf[self._pos] = tick
 
-        self.pos += 1
+        self._pos += 1
 
     def get_current(self):
         """
@@ -87,7 +130,7 @@ class RollingPanel(object):
         these objects because internal data might change
         """
 
-        where = slice(self._oldest_frame_idx(), self.pos)
+        where = slice(self._oldest_frame_idx, self._pos)
         major_axis = pd.DatetimeIndex(deepcopy(self.date_buf[where]), tz='utc')
         return pd.Panel(self.buffer.values[:, where, :], self.items,
                         major_axis, self.minor_axis, dtype=self.dtype)
@@ -98,11 +141,11 @@ class RollingPanel(object):
         passed panel.  The passed panel must have the same indices as the panel
         that would be returned by self.get_current.
         """
-        where = slice(self._oldest_frame_idx(), self.pos)
+        where = slice(self._oldest_frame_idx, self._pos)
         self.buffer.values[:, where, :] = panel.values
 
     def current_dates(self):
-        where = slice(self._oldest_frame_idx(), self.pos)
+        where = slice(self._oldest_frame_idx, self._pos)
         return pd.DatetimeIndex(deepcopy(self.date_buf[where]), tz='utc')
 
     def _roll_data(self):
@@ -111,10 +154,14 @@ class RollingPanel(object):
         Save the effort of having to expensively roll at each iteration
         """
 
-        self.buffer.values[:, :self.window, :] = \
-            self.buffer.values[:, -self.window:, :]
-        self.date_buf[:self.window] = self.date_buf[-self.window:]
-        self.pos = self.window
+        self.buffer.values[:, :self._window, :] = \
+            self.buffer.values[:, -self._window:, :]
+        self.date_buf[:self._window] = self.date_buf[-self._window:]
+        self._pos = self._window
+
+    @property
+    def window_length(self):
+        return self._window
 
 
 class MutableIndexRollingPanel(RollingPanel):
@@ -129,24 +176,24 @@ class MutableIndexRollingPanel(RollingPanel):
     def add_frame(self, tick, frame):
         """
         """
-        if self.pos == self.cap:
+        if self._pos == self.cap:
             self._roll_data()
 
         if set(frame.columns).difference(set(self.minor_axis)) or \
                 set(frame.index).difference(set(self.items)):
             self._update_buffer(frame)
 
-        self.buffer.loc[:, self.pos, :] = frame.T.astype(self.dtype)
-        self.date_buf[self.pos] = tick
+        self.buffer.loc[:, self._pos, :] = frame.T.astype(self.dtype)
+        self.date_buf[self._pos] = tick
 
-        self.pos += 1
+        self._pos += 1
 
     def _update_buffer(self, frame):
 
         # Get current frame as we only need to care about the data that is in
         # the active window
         old_buffer = self.get_current()
-        if self.pos >= self.window:
+        if self._pos >= self._window:
             # Don't count the last major_axis entry if we're past our window,
             # since it's about to roll off the end of the panel.
             old_buffer = old_buffer.iloc[:, 1:, :]

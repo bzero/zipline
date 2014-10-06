@@ -181,6 +181,9 @@ class TradingAlgorithm(object):
         self._portfolio = None
         self._account = None
 
+        self.history_container_class = kwargs.pop(
+            'history_container_class', HistoryContainer,
+        )
         self.history_container = None
         self.history_specs = {}
 
@@ -435,11 +438,13 @@ class TradingAlgorithm(object):
             self.sim_params._update_internal()
 
         # Create history containers
-        if len(self.history_specs) != 0:
-            self.history_container = HistoryContainer(
+        if self.history_specs:
+            self.history_container = self.history_container_class(
                 self.history_specs,
                 self.sim_params.sids,
-                self.sim_params.first_open)
+                self.sim_params.first_open,
+                self.sim_params.data_frequency,
+            )
 
         # Create transforms by wrapping them into StatefulTransforms
         self.transforms = []
@@ -912,21 +917,54 @@ class TradingAlgorithm(object):
         self.blotter.cancel(order_id)
 
     @api_method
-    def add_history(self, bar_count, frequency, field,
-                    ffill=True):
+    def add_history(self, bar_count, frequency, field, ffill=True):
         data_frequency = self.sim_params.data_frequency
-        daily_at_midnight = (data_frequency == 'daily')
-
         history_spec = HistorySpec(bar_count, frequency, field, ffill,
-                                   daily_at_midnight=daily_at_midnight,
                                    data_frequency=data_frequency)
         self.history_specs[history_spec.key_str] = history_spec
+        if self.initialized:
+            if self.history_container:
+                self.history_container.ensure_spec(history_spec, self.datetime)
+            else:
+                self.history_container = self.history_container_class(
+                    self.trade_sources.history_backfill,
+                    self.history_specs,
+                    self.multiverse.current_sids,
+                    self.sim_params.first_open,
+                    self.sim_params.data_frequency,
+                )
+
+    def get_history_spec(self, bar_count, frequency, field, ffill):
+        spec_key = HistorySpec.spec_key(bar_count, frequency, field, ffill)
+        if spec_key not in self.history_specs:
+            data_freq = self.sim_params.data_frequency
+            spec = HistorySpec(
+                bar_count,
+                frequency,
+                field,
+                ffill,
+                data_frequency=data_freq,
+            )
+            self.history_specs[spec_key] = spec
+            if not self.history_container:
+                self.history_container = self.history_container_class(
+                    self.history_specs,
+                    self._current_sids,
+                    self.datetime,
+                    self.sim_params.data_frequency,
+                    before_init=False,
+                )
+            self.history_container.ensure_spec(spec, self.datetime)
+        return self.history_specs[spec_key]
 
     @api_method
     def history(self, bar_count, frequency, field, ffill=True):
-        spec_key_str = HistorySpec.spec_key(
-            bar_count, frequency, field, ffill)
-        history_spec = self.history_specs[spec_key_str]
+        history_spec = self.get_history_spec(
+            bar_count,
+            frequency,
+            field,
+            ffill,
+        )
         return self.history_container.get_history(history_spec, self.datetime)
 
     ####################
@@ -1001,3 +1039,7 @@ class TradingAlgorithm(object):
         """
         return [fn for fn in cls.__dict__.itervalues()
                 if getattr(fn, 'is_api_method', False)]
+
+    @property
+    def _current_sids(self):
+        return self.sim_params.sids
